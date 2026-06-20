@@ -1,0 +1,162 @@
+name: 🚀 Deploy GoClaw to VPS
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      force_restart:
+        description: 'Force restart all containers'
+        required: false
+        default: 'false'
+        type: boolean
+
+jobs:
+  deploy:
+    name: 🐳 Deploy GoClaw
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      # ── 1. Checkout code ──────────────────────────────────────────────────
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Setup SSH agent ────────────────────────────────────────────────
+      - name: 🔑 Setup SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.VPS_SSH_KEY }}
+
+      # ── 3. Add VPS to known_hosts ─────────────────────────────────────────
+      - name: 🌐 Add VPS to known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+          echo "✅ VPS added to known_hosts"
+
+      # ── 4. Sync custom config files lên VPS (nếu có thay đổi) ────────────
+      - name: 📤 Sync config files to VPS
+        run: |
+          # Sync docker-compose.override.yml và nginx config nếu có thay đổi
+          if [ -f "docker-compose.override.yml" ]; then
+            rsync -avz --progress \
+              docker-compose.override.yml \
+              ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:${{ secrets.VPS_DEPLOY_PATH }}/
+            echo "✅ docker-compose.override.yml synced"
+          fi
+
+          if [ -f "nginx/goclaw.conf" ]; then
+            rsync -avz --progress \
+              nginx/goclaw.conf \
+              ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:/etc/nginx/sites-available/goclaw
+            echo "✅ nginx/goclaw.conf synced"
+          fi
+
+      # ── 5. Deploy: pull latest image & restart GoClaw ─────────────────────
+      - name: 🐳 Deploy GoClaw on VPS
+        env:
+          FORCE_RESTART: ${{ inputs.force_restart || 'false' }}
+        run: |
+          ssh -p ${{ secrets.VPS_PORT }} \
+            ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} \
+            FORCE_RESTART=$FORCE_RESTART \
+            DEPLOY_PATH=${{ secrets.VPS_DEPLOY_PATH }} \
+            'bash -s' << 'REMOTE_SCRIPT'
+
+          set -e
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🚀 GoClaw Deployment Started"
+          echo "📍 Path: $DEPLOY_PATH"
+          echo "⏰ Time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          cd "$DEPLOY_PATH"
+
+          # Kiểm tra file .env tồn tại
+          if [ ! -f ".env" ]; then
+            echo "❌ ERROR: .env file not found at $DEPLOY_PATH/.env"
+            echo "   Please run scripts/setup-vps.sh first!"
+            exit 1
+          fi
+
+          # Pull image mới nhất từ ghcr.io
+          echo ""
+          echo "📥 Pulling latest GoClaw image..."
+          docker compose -f docker-compose.yml -f docker-compose.postgres.yml -f docker-compose.override.yml pull goclaw
+
+          if [ "$FORCE_RESTART" = "true" ]; then
+            echo "🔄 Force restarting ALL containers..."
+            docker compose -f docker-compose.yml -f docker-compose.postgres.yml -f docker-compose.override.yml down
+            docker compose -f docker-compose.yml -f docker-compose.postgres.yml -f docker-compose.override.yml up -d
+          else
+            echo "🔄 Rolling restart GoClaw (zero-downtime)..."
+            docker compose -f docker-compose.yml -f docker-compose.postgres.yml -f docker-compose.override.yml up -d --no-deps goclaw
+          fi
+
+          echo ""
+          echo "⏳ Waiting 10s for GoClaw to initialize..."
+          sleep 10
+
+          # Health check nội bộ
+          echo "🔍 Running health check..."
+          if curl -sf http://127.0.0.1:18790/healthz > /dev/null 2>&1; then
+            echo "✅ GoClaw is healthy!"
+          else
+            echo "⚠️  Health check endpoint not responding (may not be /healthz)"
+            echo "   Checking if container is running..."
+            docker compose ps goclaw
+          fi
+
+          # Xóa images cũ
+          echo ""
+          echo "🧹 Cleaning up old images..."
+          docker image prune -f --filter "label!=keep"
+
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📊 Container Status:"
+          docker compose -f docker-compose.yml -f docker-compose.postgres.yml -f docker-compose.override.yml ps
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "✅ Deployment completed!"
+          REMOTE_SCRIPT
+
+      # ── 6. Reload Nginx nếu config thay đổi ──────────────────────────────
+      - name: 🌐 Reload Nginx if config changed
+        run: |
+          git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -q "nginx/" && \
+            ssh -p ${{ secrets.VPS_PORT }} \
+              ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} \
+              "nginx -t && systemctl reload nginx && echo '✅ Nginx reloaded'" \
+            || echo "ℹ️  No Nginx changes detected, skipping reload"
+
+      # ── 7. External health check ─────────────────────────────────────────
+      - name: 🌍 External health check
+        run: |
+          echo "⏳ Waiting 5s before external check..."
+          sleep 5
+          HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" \
+            https://agenttwo.nguyentannga.name.vn 2>/dev/null || echo "000")
+          echo "HTTP Status: $HTTP_CODE"
+          if [[ "$HTTP_CODE" == "200" ]] || [[ "$HTTP_CODE" == "301" ]] || [[ "$HTTP_CODE" == "302" ]]; then
+            echo "✅ Site is reachable at https://agenttwo.nguyentannga.name.vn"
+          else
+            echo "⚠️  Site returned HTTP $HTTP_CODE (SSL may not be configured yet)"
+          fi
+
+      # ── 8. Summary ────────────────────────────────────────────────────────
+      - name: 📋 Deployment Summary
+        if: always()
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════╗"
+          echo "║        DEPLOYMENT SUMMARY                ║"
+          echo "╠══════════════════════════════════════════╣"
+          echo "║ Repo: ${{ github.repository }}           "
+          echo "║ Branch: ${{ github.ref_name }}           "
+          echo "║ Commit: ${{ github.sha }}                "
+          echo "║ Actor: ${{ github.actor }}               "
+          echo "║ URL: https://agenttwo.nguyentannga.name.vn"
+          echo "╚══════════════════════════════════════════╝"
